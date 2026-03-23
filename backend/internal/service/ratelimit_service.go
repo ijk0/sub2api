@@ -152,6 +152,26 @@ func (s *RateLimitService) HandleUpstreamError(ctx context.Context, account *Acc
 		// OAuth 账号在 401 错误时临时不可调度（给 token 刷新窗口）；非 OAuth 账号保持原有 SetError 行为。
 		// Antigravity 除外：其 401 由 applyErrorPolicy 的 temp_unschedulable_rules 自行控制。
 		if account.Type == AccountTypeOAuth && account.Platform != PlatformAntigravity {
+			// 检查是否重复 401（上次临时不可调度也是 401），若是则升级为永久错误。
+			// 这处理了 token 被永久失效（如 token_invalidated）但刷新无法恢复的情况。
+			prevReason := account.TempUnschedulableReason
+			if prevReason == "" {
+				if dbAcc, err := s.accountRepo.GetByID(ctx, account.ID); err == nil && dbAcc != nil {
+					prevReason = dbAcc.TempUnschedulableReason
+				}
+			}
+			if isOAuth401Reason(prevReason) {
+				msg := "Authentication permanently failed (401): token refresh unsuccessful"
+				if upstreamMsg != "" {
+					msg = "Authentication permanently failed (401): " + upstreamMsg
+				}
+				slog.Warn("oauth_401_escalated_to_error", "account_id", account.ID, "platform", account.Platform,
+					"reason", "previous temp-unschedulable was also 401, token refresh did not help")
+				s.handleAuthError(ctx, account, msg)
+				shouldDisable = true
+				break
+			}
+
 			// 1. 失效缓存
 			if s.tokenCacheInvalidator != nil {
 				if err := s.tokenCacheInvalidator.InvalidateToken(ctx, account); err != nil {
@@ -1382,6 +1402,23 @@ func (s *RateLimitService) tryTempUnschedulable(ctx context.Context, account *Ac
 	}
 
 	return false
+}
+
+// isOAuth401Reason checks whether a TempUnschedulableReason indicates a previous 401.
+// It matches both the plain-text format used by the OAuth 401 handler ("OAuth 401: ..." /
+// "Authentication failed (401): ...") and the JSON TempUnschedState format used by
+// temp_unschedulable_rules.
+func isOAuth401Reason(reason string) bool {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return false
+	}
+	// JSON TempUnschedState format (from temp_unschedulable_rules path)
+	if wasTempUnschedByStatusCode(reason, 401) {
+		return true
+	}
+	// Plain-text format (from OAuth 401 handler path)
+	return strings.HasPrefix(reason, "OAuth 401:") || strings.HasPrefix(reason, "Authentication failed (401):")
 }
 
 func wasTempUnschedByStatusCode(reason string, statusCode int) bool {
